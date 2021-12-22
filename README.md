@@ -15,10 +15,8 @@ connectors:
     # Phone number that the signal-cli has been registered with.
     number: "+1234567890"
 
-    # Set to true if signal-cli-rest-api is using the json-rpc mode (recommended).
-    # See signal-cli-rest-api documentation for more info.
-    use-json-rpc: false
-
-    # If not using the json-rpc mode, set how often to poll for new messages (seconds).
+    # How often to poll for new messages, in seconds.
+    # This is ignored when signal-cli-rest-api is using the json-rpc mode (recommended),
+    # where polling is not needed.  See signal-cli-rest-api documentation for more info.
     poll-interval: 10
 ```

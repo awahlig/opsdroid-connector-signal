@@ -57,8 +57,12 @@ class ConnectorSignal(Connector):
 
     async def listen(self):
         """Listen for and parse new messages."""
+        async with self.session.get(self.make_url("/v1/about")) as resp:
+            about = await resp.json()
+        logger.debug("about signal-cli-rest-api %s", about)
+
         url = self.make_url("/v1/receive/{number}")
-        if self.configuration.get("use-json-rpc"):
+        if about.get("mode") == "json-rpc":
             async with self.session.ws_connect(url) as ws:
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
