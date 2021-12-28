@@ -12,29 +12,29 @@ logger = logging.getLogger(__name__)
 
 
 def encode_group_id(group_id):
-    # Encode group_id as returned by the websocket for use with other endpoints.
+    """Encode group_id as returned by the websocket for use with other endpoints."""
     return "group." + base64.b64encode(group_id.encode("ascii")).decode("ascii")
 
 
 class ConnectorSignal(Connector):
     """A connector for the Signal chat service."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, config, *args, **kwargs):
         """Create the connector."""
-        super().__init__(*args, **kwargs)
-        self.session = None
-        self.parsed_url = urllib.parse.urlparse(self.get_required_setting("url"))
-        self.number = self.get_required_setting("number")
+        super().__init__(config, *args, **kwargs)
 
-    def get_required_setting(self, key):
-        """Get a required setting from the config.
-        Log an error if not configured.
-        """
+        # Parse the connector configuration.
         try:
-            return self.configuration[key]
-        except KeyError:
-            logger.error("required setting '%s' not found in configuration.yml", key)
+            self.parsed_url = urllib.parse.urlparse(config["url"])
+            self.number = config["bot-number"]
+            self.whitelist = config.get("whitelisted-numbers", [])
+            self.rooms = config.get("rooms", {})
+        except KeyError as error:
+            logger.error("required setting '%s' not found", error.args[0])
             raise
+
+        self.inv_rooms = {v: k for k, v in self.rooms.items()}
+        self.session = None
 
     def make_url(self, path_format):
         """Build the url to connect with api.
@@ -42,13 +42,17 @@ class ConnectorSignal(Connector):
         phone number that the Signal client is using.
         """
         path = path_format.format(number=urllib.parse.quote(self.number))
-        return urllib.parse.urlunparse(self.parsed_url._replace(path=path))
+        return self.parsed_url._replace(path=path).geturl()
+
+    def lookup_target(self, target):
+        """Convert room alias into Signal phone number or group ID."""
+        return self.rooms.get(target, target)
 
     async def connect(self):
         """Connect to the chat service.
         In this case we just create a http session.
         """
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(raise_for_status=True)
 
     async def disconnect(self):
         """Disconnect from the chat service."""
@@ -66,18 +70,18 @@ class ConnectorSignal(Connector):
             async with self.session.ws_connect(url) as ws:
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
-                        await self.handle_packet(msg.json())
+                        await self.parse_packet(msg.json())
         else:
-            interval = self.configuration.get("poll-interval", 10)
+            interval = self.config.get("poll-interval", 10)
             while True:
                 async with self.session.get(url) as resp:
                     packets = await resp.json(content_type=None)
                 for packet in packets:
-                    await self.handle_packet(packet)
+                    await self.parse_packet(packet)
                 await asyncio.sleep(interval)
 
-    async def handle_packet(self, packet):
-        logger.debug("handle packet %s", packet)
+    async def parse_packet(self, packet):
+        logger.debug("parse packet %s", packet)
         try:
             envelope = packet["envelope"]
             args = dict(user_id=envelope["sourceNumber"],
@@ -85,35 +89,41 @@ class ConnectorSignal(Connector):
                         connector=self,
                         raw_event=packet,
                         event_id=envelope["timestamp"])
-        except KeyError:
+        except KeyError as error:
+            logger.debug("missing '%s' key", error.args[0])
+            return
+
+        if self.whitelist and args["user_id"] not in self.whitelist:
+            logger.debug("user '%s' not whitelisted", args["user_id"])
             return
 
         data_message = envelope.get("dataMessage")
         if data_message:
-            await self.handle_data_message(data_message, args)
+            await self.parse_data_message(data_message, args)
 
         typing_message = envelope.get("typingMessage")
         if typing_message:
-            await self.handle_typing_message(typing_message, args)
+            await self.parse_typing_message(typing_message, args)
 
-    async def handle_data_message(self, data_message, args):
+    async def parse_data_message(self, data_message, args):
         try:
-            args["target"] = encode_group_id(data_message["groupInfo"]["groupId"])
+            target = encode_group_id(data_message["groupInfo"]["groupId"])
         except KeyError:
-            args["target"] = args["user_id"]
+            target = args["user_id"]
+        args["target"] = self.inv_rooms.get(target, target)
 
         text = data_message.get("message")
         reaction = data_message.get("reaction")
         if reaction:
-            await self.handle_reaction(reaction, args)
+            await self.parse_reaction(reaction, args)
         elif text:
-            await self.handle_text(text, args)
+            await self.parse_text(text, args)
 
         attachments = data_message.get("attachments")
         for attachment in (attachments or ()):
-            await self.handle_attachment(attachment, args)
+            await self.parse_attachment(attachment, args)
 
-    async def handle_reaction(self, reaction, args):
+    async def parse_reaction(self, reaction, args):
         emoji = ("" if reaction.get("isRemove") else reaction["emoji"])
         linked = opsdroid.events.Event(user_id=reaction["targetAuthorNumber"],
                                        target=args["target"],
@@ -123,12 +133,12 @@ class ConnectorSignal(Connector):
         logger.info("received reaction %s from %s", event, event.target)
         await self.opsdroid.parse(event)
 
-    async def handle_text(self, text, args):
+    async def parse_text(self, text, args):
         event = opsdroid.events.Message(text=text, **args)
         logger.info("received message %s from %s", event, event.target)
         await self.opsdroid.parse(event)
 
-    async def handle_attachment(self, attachment, args):
+    async def parse_attachment(self, attachment, args):
         url = self.make_url(f"v1/attachments/{attachment['id']}")
         name = attachment.get("filename")
         mimetype = attachment.get("contentType")
@@ -146,11 +156,12 @@ class ConnectorSignal(Connector):
         logger.info("received file %s from %s", event, event.target)
         await self.opsdroid.parse(event)
 
-    async def handle_typing_message(self, typing_message, args):
+    async def parse_typing_message(self, typing_message, args):
         try:
-            args["target"] = encode_group_id(typing_message["groupId"])
+            target = encode_group_id(typing_message["groupId"])
         except KeyError:
-            args["target"] = args["user_id"]
+            target = args["user_id"]
+        args["target"] = self.inv_rooms.get(target, target)
 
         trigger = (typing_message.get("action") == "STARTED")
         user_id = args.pop("user_id")
@@ -161,13 +172,17 @@ class ConnectorSignal(Connector):
         logger.info("received typing %s from %s", event, event.target)
         await self.opsdroid.parse(event)
 
+    def get_recipients_from_event(self, event):
+        """Get Signal recipients from an opsdroid Event object."""
+        return [x for x in (self.lookup_target(event.target),) if x]
+
     @register_event(opsdroid.events.Message)
     async def send_message(self, event):
         """Send a text message."""
         logger.info("send message %s to %s", event, event.target)
         data = {
             "number": self.number,
-            "recipients": [event.target],
+            "recipients": self.get_recipients_from_event(event),
             "message": event.text,
         }
         async with self.session.post(self.make_url("/v2/send"), json=data) as resp:
@@ -181,7 +196,7 @@ class ConnectorSignal(Connector):
         file_bytes = await event.get_file_bytes()
         data = {
             "number": self.number,
-            "recipients": [event.target],
+            "recipients": self.get_recipients_from_event(event),
             "base64_attachments": [
                 base64.b64encode(file_bytes).decode("ascii"),
             ],
@@ -194,21 +209,23 @@ class ConnectorSignal(Connector):
     async def send_typing(self, event):
         """Set or remove the typing indicator."""
         logger.info("send typing %s to %s", event, event.target)
-        data = {"recipient": event.target}
         method = (self.session.put if event.trigger else self.session.delete)
-        async with method(self.make_url("/v1/typing-indicator/{number}")) as resp:
-            await resp.read()
+        url = self.make_url("/v1/typing-indicator/{number}")
+        data = {"recipient": self.get_recipients_from_event(event)[0]}
+        async with method(url, json=data) as resp:
+            await resp.json(content_type=None)
 
     @register_event(opsdroid.events.Reaction)
     async def send_reaction(self, event):
         """Send a reaction to a message."""
         logger.info("send reaction %s to %s", event, event.target)
+        method = (self.session.post if event.emoji else self.session.delete)
+        url = self.make_url("/v1/reactions/{number}")
         data = {
             "reaction": event.emoji,
-            "recipient": event.target,
+            "recipient": self.get_recipients_from_event(event)[0],
             "target_author": event.linked_event.user_id,
             "timestamp": event.linked_event.event_id,
         }
-        method = (self.session.post if event.emoji else self.session.delete)
-        async with method(self.make_url("/v1/reactions/{number}"), json=data) as resp:
-            await resp.read()
+        async with method(url, json=data) as resp:
+            await resp.json(content_type=None)
