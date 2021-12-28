@@ -26,7 +26,7 @@ class ConnectorSignal(Connector):
         # Parse the connector configuration.
         try:
             self.parsed_url = urllib.parse.urlparse(config["url"])
-            self.number = config["bot-number"]
+            self.bot_number = config["bot-number"]
             self.rooms = config.get("rooms", {})
             self.whitelist = frozenset(self.rooms.get(v, v) for v in
                                        config.get("whitelisted-numbers", []))
@@ -38,11 +38,11 @@ class ConnectorSignal(Connector):
         self.session = None
 
     def make_url(self, path_format):
-        """Build the url to connect with api.
-        Occurrences of {number} in path_format are replaced with the configured
-        phone number that the Signal client is using.
+        """Build the url to connect with the REST API.
+        Occurrences of {bot_number} in path_format are replaced with
+        the configured phone number that the Signal client is using.
         """
-        path = path_format.format(number=urllib.parse.quote(self.number))
+        path = path_format.format(bot_number=urllib.parse.quote(self.bot_number))
         return self.parsed_url._replace(path=path).geturl()
 
     def lookup_target(self, target):
@@ -68,7 +68,7 @@ class ConnectorSignal(Connector):
             about = await resp.json()
         logger.debug("about signal-cli-rest-api %s", about)
 
-        url = self.make_url("/v1/receive/{number}")
+        url = self.make_url("/v1/receive/{bot_number}")
         if about.get("mode") == "json-rpc":
             async with self.session.ws_connect(url) as ws:
                 async for msg in ws:
@@ -184,7 +184,7 @@ class ConnectorSignal(Connector):
         """Send a text message."""
         logger.info("send message %s to %s", event, event.target)
         data = {
-            "number": self.number,
+            "number": self.bot_number,
             "recipients": self.get_recipients_from_event(event),
             "message": event.text,
         }
@@ -198,7 +198,7 @@ class ConnectorSignal(Connector):
         logger.info("send file %s to %s", event, event.target)
         file_bytes = await event.get_file_bytes()
         data = {
-            "number": self.number,
+            "number": self.bot_number,
             "recipients": self.get_recipients_from_event(event),
             "base64_attachments": [
                 base64.b64encode(file_bytes).decode("ascii"),
@@ -213,7 +213,7 @@ class ConnectorSignal(Connector):
         """Set or remove the typing indicator."""
         logger.info("send typing %s to %s", event, event.target)
         method = (self.session.put if event.trigger else self.session.delete)
-        url = self.make_url("/v1/typing-indicator/{number}")
+        url = self.make_url("/v1/typing-indicator/{bot_number}")
         data = {"recipient": self.get_recipients_from_event(event)[0]}
         async with method(url, json=data) as resp:
             await resp.json(content_type=None)
@@ -223,7 +223,7 @@ class ConnectorSignal(Connector):
         """Send a reaction to a message."""
         logger.info("send reaction %s to %s", event, event.target)
         method = (self.session.post if event.emoji else self.session.delete)
-        url = self.make_url("/v1/reactions/{number}")
+        url = self.make_url("/v1/reactions/{bot_number}")
         data = {
             "reaction": event.emoji,
             "recipient": self.get_recipients_from_event(event)[0],
