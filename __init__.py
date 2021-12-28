@@ -27,8 +27,9 @@ class ConnectorSignal(Connector):
         try:
             self.parsed_url = urllib.parse.urlparse(config["url"])
             self.number = config["bot-number"]
-            self.whitelist = config.get("whitelisted-numbers", [])
             self.rooms = config.get("rooms", {})
+            self.whitelist = frozenset(self.rooms.get(v, v) for v in
+                                       config.get("whitelisted-numbers", []))
         except KeyError as error:
             logger.error("required setting '%s' not found", error.args[0])
             raise
@@ -45,7 +46,9 @@ class ConnectorSignal(Connector):
         return self.parsed_url._replace(path=path).geturl()
 
     def lookup_target(self, target):
-        """Convert room alias into Signal phone number or group ID."""
+        """Convert room alias into Signal phone number or group ID.
+        This is called by constrain_rooms decorator.
+        """
         return self.rooms.get(target, target)
 
     async def connect(self):
